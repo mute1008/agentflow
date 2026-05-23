@@ -169,6 +169,7 @@ def _write_daemon_metadata(metadata_path: Path, *, host: str, port: int, pid: in
 
 @contextmanager
 def _daemon_startup_lock(metadata_path: Path):
+    """Serialize daemon startup and metadata updates across local processes."""
     lock_path = metadata_path.parent / f"{metadata_path.name}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as handle:
