@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import os
+from contextlib import contextmanager
 import json
+import os
 import subprocess
 import sys
 import time
@@ -21,6 +22,11 @@ import httpx
 import typer
 from jinja2 import TemplateError
 from pydantic import ValidationError
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
 from agentflow.defaults import (
     bundled_templates,
     bundled_template_names,
@@ -156,7 +162,23 @@ def _load_daemon_metadata(metadata_path: Path) -> dict[str, object] | None:
 def _write_daemon_metadata(metadata_path: Path, *, host: str, port: int, pid: int) -> None:
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"host": host, "port": port, "pid": pid}
-    metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path = metadata_path.parent / f"{metadata_path.name}.tmp"
+    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path.replace(metadata_path)
+
+
+@contextmanager
+def _daemon_startup_lock(metadata_path: Path):
+    lock_path = metadata_path.parent / f"{metadata_path.name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _daemon_is_healthy(base_url: str) -> bool:
@@ -187,6 +209,14 @@ def _wait_for_daemon(base_url: str, *, timeout_seconds: float = 5.0) -> None:
         if _daemon_is_healthy(base_url):
             return
         time.sleep(0.1)
+    typer.echo(
+        (
+            f"Timed out waiting for the daemon at {base_url} to become healthy. "
+            "Check whether that host/port is already in use, inspect daemon startup errors, "
+            "or try starting `agentflow serve` manually with the same --host/--port values."
+        ),
+        err=True,
+    )
     raise typer.Exit(code=1)
 
 
@@ -198,19 +228,20 @@ def _ensure_daemon(
     port: int,
     metadata_path: Path,
 ) -> str:
-    metadata = _load_daemon_metadata(metadata_path)
-    metadata_host = metadata.get("host") if isinstance(metadata, dict) else None
-    metadata_port = metadata.get("port") if isinstance(metadata, dict) else None
-    if isinstance(metadata_host, str) and isinstance(metadata_port, int) and (metadata_host, metadata_port) == (host, port):
-        base_url = _daemon_base_url(metadata_host, metadata_port)
-        if _daemon_is_healthy(base_url):
-            return base_url
-
     base_url = _daemon_base_url(host, port)
-    process = _start_daemon(host=host, port=port, runs_dir=runs_dir, max_concurrent_runs=max_concurrent_runs)
-    _write_daemon_metadata(metadata_path, host=host, port=port, pid=process.pid)
-    _wait_for_daemon(base_url)
-    return base_url
+    with _daemon_startup_lock(metadata_path):
+        metadata = _load_daemon_metadata(metadata_path)
+        metadata_host = metadata.get("host") if isinstance(metadata, dict) else None
+        metadata_port = metadata.get("port") if isinstance(metadata, dict) else None
+        if isinstance(metadata_host, str) and isinstance(metadata_port, int) and (metadata_host, metadata_port) == (host, port):
+            metadata_base_url = _daemon_base_url(metadata_host, metadata_port)
+            if _daemon_is_healthy(metadata_base_url):
+                return metadata_base_url
+
+        process = _start_daemon(host=host, port=port, runs_dir=runs_dir, max_concurrent_runs=max_concurrent_runs)
+        _wait_for_daemon(base_url)
+        _write_daemon_metadata(metadata_path, host=host, port=port, pid=process.pid)
+        return base_url
 
 
 def _submit_detached_run(pipeline: object, base_url: str) -> RunRecord:
@@ -218,14 +249,23 @@ def _submit_detached_run(pipeline: object, base_url: str) -> RunRecord:
     base_dir = getattr(pipeline, "base_dir", None)
     if isinstance(base_dir, str) and base_dir:
         payload["base_dir"] = base_dir
-    response = httpx.post(f"{base_url}/api/runs", json=payload, timeout=10.0)
+    try:
+        response = httpx.post(f"{base_url}/api/runs", json=payload, timeout=10.0)
+    except httpx.RequestError as exc:
+        typer.echo(f"Failed to submit run to daemon at {base_url}: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text.strip()
-        typer.echo(f"Failed to submit run: {detail}", err=True)
+        typer.echo(f"Failed to submit run to daemon at {base_url}: {detail}", err=True)
         raise typer.Exit(code=1) from exc
-    return RunRecord.model_validate(response.json())
+    try:
+        data = response.json()
+    except ValueError as exc:
+        typer.echo(f"Failed to submit run to daemon at {base_url}: invalid JSON response", err=True)
+        raise typer.Exit(code=1) from exc
+    return RunRecord.model_validate(data)
 
 
 def _render_tuned_agents_summary(records: list[object]) -> str:

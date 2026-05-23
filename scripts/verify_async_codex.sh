@@ -181,7 +181,7 @@ cat > "${PR11_SEED_REPO}/README.md" <<'EOF'
 # local-codex-smoke
 EOF
 git -C "$PR11_SEED_REPO" add README.md
-git -C "$PR11_SEED_REPO" commit -m "init local smoke repo" >/dev/null
+git -c user.name="AgentFlow Verify" -c user.email="verify@example.invalid" -C "$PR11_SEED_REPO" commit -m "init local smoke repo" >/dev/null
 
 mkdir -p "${PR11_WORKSPACE}/agent_tuner"
 cat > "${PR11_WORKSPACE}/agent_tuner/local_codex_smoke.yaml" <<EOF

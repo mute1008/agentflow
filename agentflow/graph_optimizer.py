@@ -22,6 +22,7 @@ OPTIMIZER_PROMPT_FILENAME = "optimizer-prompt.txt"
 OPTIMIZER_RESULT_FILENAME = "optimizer-result.json"
 OPTIMIZER_VALIDATION_FILENAME = "optimizer-validation.json"
 GRAPH_OPTIMIZER_MAX_ATTEMPTS = 3
+CHILD_PIPELINE_LOAD_TIMEOUT_SECONDS = 5.0
 
 
 def editable_pipeline_payload(pipeline: PipelineSpec) -> dict[str, Any]:
@@ -214,12 +215,24 @@ def load_child_pipeline_from_path(path: Path) -> PipelineSpec:
 
     path = Path(path)
     if path.suffix == ".py":
-        result = subprocess.run(
-            [sys.executable, str(path)],
-            capture_output=True,
-            text=True,
-            cwd=str(path.parent),
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, str(path)],
+                capture_output=True,
+                text=True,
+                cwd=str(path.parent),
+                timeout=CHILD_PIPELINE_LOAD_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            details: list[str] = []
+            if exc.stdout:
+                details.append(f"stdout:\n{exc.stdout.strip()}")
+            if exc.stderr:
+                details.append(f"stderr:\n{exc.stderr.strip()}")
+            rendered_details = "" if not details else "\n" + "\n\n".join(details)
+            raise ValueError(
+                f"pipeline script `{path}` timed out after {CHILD_PIPELINE_LOAD_TIMEOUT_SECONDS:.1f}s.{rendered_details}"
+            ) from exc
         if result.returncode != 0:
             raise ValueError(f"pipeline script `{path}` failed:\n{result.stderr.strip()}")
         raw_text = result.stdout

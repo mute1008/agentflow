@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -2988,6 +2989,111 @@ def test_start_daemon_uses_explicit_host_and_port_flags(monkeypatch):
     assert captured["kwargs"]["start_new_session"] is True
     assert captured["kwargs"]["env"]["AGENTFLOW_RUNS_DIR"] == "/tmp/agentflow-runs"
     assert captured["kwargs"]["env"]["AGENTFLOW_MAX_CONCURRENT_RUNS"] == "5"
+
+
+def test_wait_for_daemon_prints_timeout_diagnostic(monkeypatch):
+    messages: list[tuple[str, bool]] = []
+    monotonic_values = iter([0.0, 0.0, 0.2])
+
+    monkeypatch.setattr(agentflow.cli, "_daemon_is_healthy", lambda base_url: False)
+    monkeypatch.setattr(agentflow.cli.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(agentflow.cli.time, "sleep", lambda _: None)
+    monkeypatch.setattr(agentflow.cli.typer, "echo", lambda message, err=False: messages.append((message, err)))
+
+    with pytest.raises(typer.Exit) as exc_info:
+        agentflow.cli._wait_for_daemon("http://127.0.0.1:8123", timeout_seconds=0.1)
+
+    assert exc_info.value.exit_code == 1
+    assert messages == [
+        (
+            "Timed out waiting for the daemon at http://127.0.0.1:8123 to become healthy. "
+            "Check whether that host/port is already in use, inspect daemon startup errors, "
+            "or try starting `agentflow serve` manually with the same --host/--port values.",
+            True,
+        )
+    ]
+
+
+def test_ensure_daemon_locks_startup_and_metadata_write(monkeypatch, tmp_path):
+    calls: list[str] = []
+
+    @contextmanager
+    def fake_lock(metadata_path: Path):
+        calls.append(f"enter:{metadata_path.name}")
+        try:
+            yield
+        finally:
+            calls.append("exit")
+
+    monkeypatch.setattr(agentflow.cli, "_daemon_startup_lock", fake_lock)
+    monkeypatch.setattr(agentflow.cli, "_load_daemon_metadata", lambda path: calls.append("load") or None)
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_start_daemon",
+        lambda **kwargs: calls.append("start") or SimpleNamespace(pid=12345),
+    )
+    monkeypatch.setattr(agentflow.cli, "_wait_for_daemon", lambda base_url: calls.append(f"wait:{base_url}"))
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_write_daemon_metadata",
+        lambda metadata_path, **kwargs: calls.append(f"write:{metadata_path.name}:{kwargs['pid']}"),
+    )
+
+    base_url = agentflow.cli._ensure_daemon(
+        "/tmp/agentflow-runs",
+        5,
+        host="127.0.0.1",
+        port=8123,
+        metadata_path=tmp_path / "daemon.json",
+    )
+
+    assert base_url == "http://127.0.0.1:8123"
+    assert calls == [
+        "enter:daemon.json",
+        "load",
+        "start",
+        "wait:http://127.0.0.1:8123",
+        "write:daemon.json:12345",
+        "exit",
+    ]
+
+
+def test_submit_detached_run_handles_request_error(monkeypatch):
+    messages: list[tuple[str, bool]] = []
+    fake_pipeline = SimpleNamespace(model_dump=lambda mode="json": {"name": "detached", "nodes": []})
+
+    def fake_post(*args, **kwargs):
+        raise agentflow.cli.httpx.RequestError("connection refused")
+
+    monkeypatch.setattr(agentflow.cli.httpx, "post", fake_post)
+    monkeypatch.setattr(agentflow.cli.typer, "echo", lambda message, err=False: messages.append((message, err)))
+
+    with pytest.raises(typer.Exit) as exc_info:
+        agentflow.cli._submit_detached_run(fake_pipeline, "http://daemon.test")
+
+    assert exc_info.value.exit_code == 1
+    assert messages == [("Failed to submit run to daemon at http://daemon.test: connection refused", True)]
+
+
+def test_submit_detached_run_handles_invalid_json(monkeypatch):
+    messages: list[tuple[str, bool]] = []
+    fake_pipeline = SimpleNamespace(model_dump=lambda mode="json": {"name": "detached", "nodes": []})
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> object:
+            raise ValueError("not json")
+
+    monkeypatch.setattr(agentflow.cli.httpx, "post", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(agentflow.cli.typer, "echo", lambda message, err=False: messages.append((message, err)))
+
+    with pytest.raises(typer.Exit) as exc_info:
+        agentflow.cli._submit_detached_run(fake_pipeline, "http://daemon.test")
+
+    assert exc_info.value.exit_code == 1
+    assert messages == [("Failed to submit run to daemon at http://daemon.test: invalid JSON response", True)]
 
 
 def test_run_defaults_to_summary_on_tty(monkeypatch):
