@@ -25,6 +25,7 @@ def editable_pipeline_payload(pipeline: PipelineSpec) -> dict[str, Any]:
     payload = pipeline.model_dump(mode="json")
     payload.pop("optimizer", None)
     payload.pop("n_run", None)
+    payload.pop("evaluator", None)
     return payload
 
 
@@ -70,6 +71,7 @@ def build_graph_report(
     run: RunRecord,
     store: RunStore,
     copied_traces: dict[str, str],
+    evaluator_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     nodes: list[dict[str, Any]] = []
     pipeline_nodes = run.pipeline.node_map
@@ -102,7 +104,7 @@ def build_graph_report(
             }
         )
 
-    return {
+    report = {
         "parent_run_id": parent_run_id,
         "round_number": round_number,
         "total_rounds": total_rounds,
@@ -118,6 +120,9 @@ def build_graph_report(
         "events": [event.model_dump(mode="json") for event in store.get_events(run.id)],
         "nodes": nodes,
     }
+    if evaluator_result is not None:
+        report["evaluator"] = evaluator_result
+    return report
 
 
 def render_graph_optimizer_prompt(
@@ -155,6 +160,7 @@ def render_graph_optimizer_prompt(
         "Working materials:\n"
         "- `pipeline.py` is the only file you should edit.\n"
         "- `graph_report.json` contains the current graph, node outcomes, timings, outputs, attempts, events, and artifact paths.\n"
+        "- If configured, `graph_report.json` also contains fixed evaluator feedback under `evaluator`; this is not editable.\n"
         "- `traces/` contains per-node trace files copied from the completed round.\n"
         "\n"
         "Allowed graph changes:\n"
@@ -166,6 +172,7 @@ def render_graph_optimizer_prompt(
         "\n"
         "Guardrails:\n"
         "- Edit `pipeline.py` in place.\n"
+        "- Do not add, remove, or emulate fixed evaluator/scorer configuration; it is controlled by the outer harness.\n"
         "- Preserve a valid Python script that defines `PIPELINE` and prints it as JSON when executed.\n"
         "- Keep at least one node in the graph.\n"
         "- Keep node ids stable unless there is a strong reason to rename, add, or remove them.\n"

@@ -95,6 +95,7 @@ class Graph:
         node_defaults: dict[str, Any] | None = None,
         agent_defaults: dict[str | AgentKind, dict[str, Any]] | None = None,
         local_target_defaults: dict[str, Any] | LocalTarget | None = None,
+        evaluator: dict[str, Any] | None = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -109,6 +110,7 @@ class Graph:
         self.node_defaults = node_defaults
         self.agent_defaults = agent_defaults
         self.local_target_defaults = local_target_defaults
+        self.evaluator = evaluator
         self._nodes: dict[str, NodeBuilder] = {}
         self._token: Token[Graph | None] | None = None
 
@@ -154,6 +156,8 @@ class Graph:
             payload["agent_defaults"] = _normalize_agent_defaults(self.agent_defaults)
         if self.local_target_defaults is not None:
             payload["local_target_defaults"] = self.local_target_defaults
+        if self.evaluator is not None:
+            payload["evaluator"] = deepcopy(self.evaluator)
         payload["nodes"] = [node.to_payload() for node in self._nodes.values()]
         return payload
 

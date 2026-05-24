@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -11,6 +12,7 @@ from agentflow.graph_optimizer import (
     GRAPH_OPTIMIZER_MAX_ATTEMPTS,
     GENERATED_PIPELINE_EDITED_FILENAME,
     GENERATED_PIPELINE_ORIGINAL_FILENAME,
+    GRAPH_REPORT_FILENAME,
     OPTIMIZER_VALIDATION_FILENAME,
     editable_pipeline_payload,
     render_graph_optimizer_prompt,
@@ -27,6 +29,7 @@ def test_editable_pipeline_python_round_trips(tmp_path):
         {
             "name": "roundtrip",
             "working_dir": str(tmp_path),
+            "evaluator": {"command": [sys.executable, "-c", "print('{}')"]},
             "concurrency": 2,
             "nodes": [
                 {"id": "plan", "agent": "codex", "prompt": "plan"},
@@ -42,7 +45,9 @@ def test_editable_pipeline_python_round_trips(tmp_path):
     payload = loaded.model_dump(mode="json")
     payload.pop("optimizer", None)
     payload.pop("n_run", None)
+    payload.pop("evaluator", None)
     assert payload == editable_pipeline_payload(pipeline)
+    assert "evaluator" not in editable_pipeline_payload(pipeline)
 
 
 def test_pipeline_spec_requires_optimizer_when_n_run_exceeds_one(tmp_path):
@@ -92,6 +97,17 @@ def test_graph_optimizer_prompt_includes_goal_guardrails_and_validation(tmp_path
 
 def test_orchestrator_runs_graph_optimization_rounds(tmp_path, monkeypatch):
     orchestrator = make_orchestrator(tmp_path)
+    evaluator_path = tmp_path / "evaluate.py"
+    evaluator_path.write_text(
+        (
+            "import json, os\n"
+            "print(json.dumps({\n"
+            "  'scalar_score': 10,\n"
+            "  'child_run_id': os.environ['AGENTFLOW_CHILD_RUN_ID'],\n"
+            "}))\n"
+        ),
+        encoding="utf-8",
+    )
 
     def fake_optimizer(_optimizer, *, prompt: str, repo_dir: Path, runtime_dir: Path, env: dict[str, str]):
         pipeline_path = repo_dir / "pipeline.py"
@@ -107,6 +123,7 @@ def test_orchestrator_runs_graph_optimization_rounds(tmp_path, monkeypatch):
             "working_dir": str(tmp_path),
             "optimizer": "codex",
             "n_run": 2,
+            "evaluator": {"command": [sys.executable, str(evaluator_path)]},
             "nodes": [{"id": "plan", "agent": "codex", "prompt": "round one"}],
         }
     )
@@ -121,10 +138,14 @@ def test_orchestrator_runs_graph_optimization_rounds(tmp_path, monkeypatch):
     assert len(child_run_ids) == 2
     assert orchestrator.store.get_run(child_run_ids[0]).nodes["plan"].output == "round one"
     assert orchestrator.store.get_run(child_run_ids[1]).nodes["plan"].output == "round two"
+    assert completed.pipeline.evaluator == pipeline.evaluator
 
     round_one_dir = orchestrator.store.run_dir(run.id) / "optimization" / "round-001"
     assert (round_one_dir / GENERATED_PIPELINE_ORIGINAL_FILENAME).exists()
     assert (round_one_dir / GENERATED_PIPELINE_EDITED_FILENAME).exists()
+    graph_report = json.loads((round_one_dir / GRAPH_REPORT_FILENAME).read_text(encoding="utf-8"))
+    assert graph_report["evaluator"]["result"]["scalar_score"] == 10
+    assert graph_report["evaluator"]["result"]["child_run_id"] == child_run_ids[0]
 
 
 def test_orchestrator_retries_invalid_optimized_pipeline_with_error_context(tmp_path, monkeypatch):

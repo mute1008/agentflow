@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+import os
 import json
+import subprocess
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -40,6 +42,7 @@ from agentflow.loader import load_pipeline_from_path
 from agentflow.prepared import ExecutionPaths, PreparedExecution, build_execution_paths
 from agentflow.runners.registry import RunnerRegistry, default_runner_registry
 from agentflow.specs import (
+    EvaluatorSpec,
     NodeAttempt,
     NodeResult,
     NodeStatus,
@@ -82,6 +85,75 @@ class _NodeExecutionOutcome:
     periodic_tick_number: int | None = None
     periodic_actions: _PeriodicActionEnvelope | None = None
     periodic_action_parse_error: str | None = None
+
+
+def _tail_text(value: str, limit: int = 4096) -> str:
+    if len(value) <= limit:
+        return value
+    return value[-limit:]
+
+
+def _run_fixed_evaluator(
+    evaluator: EvaluatorSpec,
+    *,
+    parent_run_id: str,
+    child_run_id: str,
+    round_number: int,
+    working_dir: Path,
+    child_run_dir: Path,
+    round_dir: Path,
+) -> dict[str, Any]:
+    cwd = Path(evaluator.cwd).expanduser() if evaluator.cwd else working_dir
+    if not cwd.is_absolute():
+        cwd = (working_dir / cwd).resolve()
+
+    env = {
+        **os.environ,
+        **evaluator.env,
+        "AGENTFLOW_PARENT_RUN_ID": parent_run_id,
+        "AGENTFLOW_CHILD_RUN_ID": child_run_id,
+        "AGENTFLOW_OPTIMIZATION_ROUND": str(round_number),
+        "AGENTFLOW_WORKING_DIR": str(working_dir),
+        "AGENTFLOW_CHILD_RUN_DIR": str(child_run_dir),
+        "AGENTFLOW_ROUND_DIR": str(round_dir),
+    }
+    try:
+        completed = subprocess.run(
+            evaluator.command,
+            cwd=str(cwd),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=evaluator.timeout_seconds,
+        )
+        parsed: Any | None = None
+        stripped_stdout = completed.stdout.strip()
+        if stripped_stdout:
+            try:
+                parsed = json.loads(stripped_stdout)
+            except json.JSONDecodeError:
+                parsed = None
+        result: dict[str, Any] = {
+            "command": evaluator.command,
+            "cwd": str(cwd),
+            "exit_code": completed.returncode,
+            "timeout": False,
+            "stdout_tail": _tail_text(completed.stdout),
+            "stderr_tail": _tail_text(completed.stderr),
+        }
+        if isinstance(parsed, dict):
+            result["result"] = parsed
+        return result
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "command": evaluator.command,
+            "cwd": str(cwd),
+            "exit_code": None,
+            "timeout": True,
+            "stdout_tail": _tail_text(exc.stdout or ""),
+            "stderr_tail": _tail_text(exc.stderr or ""),
+        }
 
 
 @dataclass(slots=True)
@@ -364,6 +436,29 @@ class Orchestrator:
                 child_status=final_child.status.value,
             )
 
+            evaluator_result = None
+            if current_pipeline.evaluator is not None:
+                evaluator_result = _run_fixed_evaluator(
+                    current_pipeline.evaluator,
+                    parent_run_id=parent_run_id,
+                    child_run_id=final_child.id,
+                    round_number=round_number,
+                    working_dir=current_pipeline.working_path,
+                    child_run_dir=self.store.run_dir(final_child.id),
+                    round_dir=round_dir,
+                )
+                (round_dir / "evaluator-result.json").write_text(
+                    json.dumps(evaluator_result, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                await self._publish(
+                    parent_run_id,
+                    "optimization_evaluator_completed",
+                    round_number=round_number,
+                    child_run_id=final_child.id,
+                    evaluator=evaluator_result,
+                )
+
             traces_dir = ensure_dir(round_dir / "traces")
             copied_traces = copy_run_traces(final_child, self.store, traces_dir)
             graph_report = build_graph_report(
@@ -373,6 +468,7 @@ class Orchestrator:
                 run=final_child,
                 store=self.store,
                 copied_traces=copied_traces,
+                evaluator_result=evaluator_result,
             )
             (round_dir / GRAPH_REPORT_FILENAME).write_text(json.dumps(graph_report, ensure_ascii=False, indent=2), encoding="utf-8")
             await self.store.persist_run(parent_run_id)
@@ -480,7 +576,11 @@ class Orchestrator:
                 )
 
             current_pipeline = loaded_pipeline.model_copy(
-                update={"optimizer": optimizer_name, "n_run": parent.pipeline.n_run}
+                update={
+                    "optimizer": optimizer_name,
+                    "n_run": parent.pipeline.n_run,
+                    "evaluator": current_pipeline.evaluator,
+                }
             )
             parent.pipeline = current_pipeline
             await self._publish(

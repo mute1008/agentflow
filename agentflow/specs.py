@@ -771,6 +771,25 @@ class PeriodicScheduleSpec(BaseModel):
         return normalized
 
 
+class EvaluatorSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command: list[str]
+    timeout_seconds: int = Field(default=300, gt=0)
+    cwd: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("command")
+    @classmethod
+    def validate_command(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("`evaluator.command` must not be empty")
+        normalized = [str(part) for part in value]
+        if not normalized[0].strip():
+            raise ValueError("`evaluator.command[0]` must not be empty")
+        return normalized
+
+
 class NodeSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1464,6 +1483,7 @@ class PipelineSpec(BaseModel):
     node_defaults: dict[str, Any] | None = None
     agent_defaults: dict[AgentKind, dict[str, Any]] = Field(default_factory=dict)
     local_target_defaults: LocalTarget | None = None
+    evaluator: EvaluatorSpec | None = None
     fanouts: dict[str, list[str]] = Field(default_factory=dict)
     nodes: list[NodeSpec]
 
