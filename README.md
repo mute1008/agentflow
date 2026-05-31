@@ -260,3 +260,18 @@ That opt-in is meant for trusted operator-controlled workflows only.
 * [kiss-ai](https://github.com/ksenxx/kiss_ai)
 * [claude-code-telegram](https://github.com/RichardAtCT/claude-code-telegram)
 * [linux.do](https://linux.do)
+
+## Citation
+If you use this tool, please cite our paper:
+
+```
+@misc{liu2026synthesizingmultiagentharnessesvulnerability,
+      title={Synthesizing Multi-Agent Harnesses for Vulnerability Discovery}, 
+      author={Hanzhi Liu and Chaofan Shou and Xiaonan Liu and Hongbo Wen and Yanju Chen and Ryan Jingyang Fang and Yu Feng},
+      year={2026},
+      eprint={2604.20801},
+      archivePrefix={arXiv},
+      primaryClass={cs.CR},
+      url={https://arxiv.org/abs/2604.20801}, 
+}
+```
