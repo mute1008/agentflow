@@ -249,15 +249,32 @@ class LocalRunner(Runner):
         await self._wait_for_exit(wait_task, self._TERMINATE_GRACE_SECONDS)
 
     async def _consume_stream(self, node: NodeSpec, stream, stream_name: str, buffer: list[str], on_output: StreamCallback) -> None:
-        while True:
-            line = await stream.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace").rstrip("\n")
+        async def _emit(raw: bytes) -> None:
+            text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             if stream_name == "stderr" and self._should_suppress_stderr(node, text):
-                continue
+                return
             buffer.append(text)
             await on_output(stream_name, text)
+
+        # Read fixed-size chunks and split on newlines ourselves instead of stream.readline().
+        # asyncio StreamReader.readline() raises ValueError("Separator is not found, and chunk
+        # exceed the limit") on any line longer than its 64 KiB buffer. Agent CLIs hit this: codex
+        # `exec --json` emits one JSON event per line, and a `command_execution` event inlines the
+        # full stdout of a shell command the agent ran (e.g. a recursive grep over the source tree)
+        # into a single >64 KiB line. That exception kills this task, so the agent's stdout stops
+        # being drained; the agent then blocks on pipe_write and never exits, and the node hangs
+        # until its timeout. Chunked reads have no per-line size limit.
+        pending = b""
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                if pending:
+                    await _emit(pending)
+                break
+            pending += chunk
+            while b"\n" in pending:
+                raw, pending = pending.split(b"\n", 1)
+                await _emit(raw)
 
     async def execute(
         self,
