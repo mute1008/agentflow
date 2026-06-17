@@ -41,12 +41,9 @@ class CodexAdapter(AgentAdapter):
                 lines.append(f"env_key = {self._format_toml_value(provider.api_key_env)}")
             if provider.wire_api:
                 lines.append(f"wire_api = {self._format_toml_value(provider.wire_api)}")
-        if provider:
-            lines.append("")
-            lines.append("[profiles.agentflow]")
-            if node.model:
-                lines.append(f"model = {self._format_toml_value(node.model)}")
-            lines.append(f"model_provider = {self._format_toml_value(provider.name)}")
+        # NOTE: the profile (model + model_provider) is NOT written here as a legacy
+        # [profiles.agentflow] table — Codex 0.136+ rejects that with `--profile agentflow`. It is
+        # emitted as a separate `agentflow.config.toml` (see _render_profile_config + the caller).
         if node.mcps:
             for mcp in node.mcps:
                 lines.append("")
@@ -63,6 +60,16 @@ class CodexAdapter(AgentAdapter):
                         lines.append(f"url = {self._format_toml_value(mcp.url)}")
                     if mcp.headers:
                         lines.append(f"http_headers = {self._format_toml_value(mcp.headers)}")
+        return "\n".join(lines) + "\n"
+
+    def _render_profile_config(self, node: NodeSpec, provider: ProviderConfig) -> str:
+        # Codex 0.136+ loads `--profile <name>` from a separate `<name>.config.toml` layered over
+        # config.toml; a legacy [profiles.<name>] table inside config.toml is a hard error. Emit the
+        # profile (model + model_provider) here; the base config.toml carries [model_providers.<name>].
+        lines: list[str] = []
+        if node.model:
+            lines.append(f"model = {self._format_toml_value(node.model)}")
+        lines.append(f"model_provider = {self._format_toml_value(provider.name)}")
         return "\n".join(lines) + "\n"
 
     def _resolve_sandbox_mode(self, node: NodeSpec, env: dict[str, str]) -> str:
@@ -157,6 +164,10 @@ class CodexAdapter(AgentAdapter):
                     node,
                     provider,
                     sandbox,
+                )
+            if provider:
+                runtime_files[self.relative_runtime_file("codex_home", "agentflow.config.toml")] = (
+                    self._render_profile_config(node, provider)
                 )
             host_auth = Path.home() / ".codex" / "auth.json"
             if host_auth.is_file():
